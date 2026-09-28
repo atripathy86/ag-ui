@@ -40,17 +40,20 @@ Two details the SDK forces on us:
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import inspect
 import json
 import logging
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ag_ui.core import (
     BaseEvent,
     Interrupt,
+    StateSnapshotEvent,
     Tool as AGUITool,
     ToolCallArgsEvent,
     ToolCallEndEvent,
@@ -78,6 +81,43 @@ _ABANDONED = (
     "The user sent a new message instead of answering this request, so it was "
     "not completed. Do not report it as declined."
 )
+
+
+# The bridge of the session whose server tool is running, so get_state() and
+# set_state() can reach it without the tool taking a parameter the SDK would
+# put into the tool's schema.
+_CURRENT_BRIDGE: ContextVar[Optional["UIBridge"]] = ContextVar(
+    "ag_ui_antigravity_bridge", default=None
+)
+
+
+def _current_bridge(caller: str) -> "UIBridge":
+    bridge = _CURRENT_BRIDGE.get()
+    if bridge is None:
+        raise RuntimeError(
+            f"{caller}() can only be called from inside a server tool passed "
+            "to AntigravityAgent(tools=[...]) while it runs."
+        )
+    return bridge
+
+
+def get_state() -> Dict[str, Any]:
+    """Returns a copy of the current session's shared state.
+
+    Call it from a server tool. The state is what the client sent with the
+    run, or what the last set_state() call stored, whichever is newer.
+    """
+    return _current_bridge("get_state").state
+
+
+def set_state(state: Dict[str, Any]) -> None:
+    """Replaces the current session's shared state and streams it to the client.
+
+    Call it from a server tool. The client receives a STATE_SNAPSHOT right
+    away, before the tool's own result, so a UI bound to agent state updates
+    while the turn is still running.
+    """
+    _current_bridge("set_state").replace_state(state)
 
 
 @dataclass
@@ -113,6 +153,13 @@ class UIBridge:
         # this turn. Keyed on name alone, so a concurrent call with *different*
         # arguments also waits on it rather than dispatching a second time.
         self._turn_results: Dict[str, tuple] = {}
+        # The session's shared state, as server tools see it. Seeded from each
+        # run's RunAgentInput.state and replaced by set_state().
+        self._state: Dict[str, Any] = {}
+        # True from set_state() until its snapshot is drained into a run. While
+        # it is set the client has not seen our state yet, so the state it
+        # sends back is older than ours and must not overwrite it.
+        self._state_undelivered = False
 
     def reset_turn(self) -> None:
         """Retires the per-turn frontend-tool claims.
@@ -137,7 +184,50 @@ class UIBridge:
             try:
                 events.append(self._queue.get_nowait())
             except asyncio.QueueEmpty:
-                return events
+                break
+        if any(isinstance(e, StateSnapshotEvent) for e in events):
+            self._state_undelivered = False
+        return events
+
+    # ------------------------------------------------------------------
+    # Shared state
+    # ------------------------------------------------------------------
+
+    @property
+    def state(self) -> Dict[str, Any]:
+        """A copy of the session's shared state."""
+        return copy.deepcopy(self._state)
+
+    def adopt_client_state(self, state: Any) -> None:
+        """Takes the state a run arrived with as the session's current state.
+
+        The client applies every STATE_SNAPSHOT we send and returns the result
+        on its next run, so its copy is normally the newest one -- it also
+        carries edits the user made in the UI. The exception is a snapshot a
+        server tool emitted while no run was attached (the turn was parked):
+        the client has not received it yet, so what it sends is stale.
+        """
+        if self._state_undelivered:
+            return
+        self._state = copy.deepcopy(state) if isinstance(state, dict) else {}
+
+    def replace_state(self, state: Dict[str, Any]) -> None:
+        """Replaces the shared state and streams it as a STATE_SNAPSHOT."""
+        if not isinstance(state, dict):
+            raise TypeError(
+                f"state must be a dict, got {type(state).__name__}"
+            )
+        # Round-trip through JSON so the stored state is exactly what the
+        # client receives, and a non-serializable value fails here, in the
+        # tool that set it, not later inside the event encoder.
+        snapshot = json.loads(json.dumps(state))
+        self._state = snapshot
+        self._state_undelivered = True
+        self.emit(
+            StateSnapshotEvent(
+                type="STATE_SNAPSHOT", snapshot=copy.deepcopy(snapshot)
+            )
+        )
 
     @property
     def has_pending(self) -> bool:
@@ -301,6 +391,7 @@ class UIBridge:
             bridge.emit(
                 ToolCallEndEvent(type="TOOL_CALL_END", tool_call_id=tool_call_id)
             )
+            token = _CURRENT_BRIDGE.set(bridge)
             try:
                 result = tool(*args, **kwargs)
                 if is_async or inspect.isawaitable(result):
@@ -317,6 +408,8 @@ class UIBridge:
                     )
                 )
                 raise
+            finally:
+                _CURRENT_BRIDGE.reset(token)
             bridge.emit(
                 ToolCallResultEvent(
                     type="TOOL_CALL_RESULT",

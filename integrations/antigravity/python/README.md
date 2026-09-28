@@ -83,6 +83,7 @@ on this point.)
 | `TOOL_CALL` (built-in / MCP) | `TOOL_CALL_START` / `ARGS` / `END` / `RESULT` |
 | `start_subagent` | `STEP_STARTED` / `STEP_FINISHED` around the delegated work |
 | `FINISH.structured_output` | `STATE_SNAPSHOT` (or `CUSTOM`) |
+| `set_state()` inside a server tool | `STATE_SNAPSHOT` |
 | iterator exhaustion | `RUN_FINISHED` |
 | raised `Antigravity*Error` | `RUN_ERROR` (except a mid-stream cancel, which ends `RUN_FINISHED`) |
 | parked hook (question / approval) | `RUN_FINISHED` with an interrupt outcome |
@@ -198,6 +199,40 @@ The wrapper preserves each function's signature and docstring, so the SDK still
 derives the same tool schema. Return a JSON-serializable value (or a string);
 a raised exception is reported to the client as
 `There was an error executing <tool>: ...` and re-raised.
+
+### Shared state from server tools
+
+A server tool can read and write the AG-UI shared state of the session it runs
+in:
+
+```python
+from ag_ui_antigravity import get_state, set_state
+
+async def research_agent(task: str) -> str:
+    """Delegates a research task."""
+    facts = await run_research(task)
+    state = get_state()
+    set_state({**state, "delegations": state.get("delegations", []) + [facts]})
+    return facts
+```
+
+`get_state()` returns a copy of the session's state: what the client sent with
+the run (`RunAgentInput.state`), or what the last `set_state()` stored if the
+client has not received that yet. `set_state()` replaces the whole state and
+emits a `STATE_SNAPSHOT` at once, before the tool's `TOOL_CALL_RESULT`, so a UI
+bound to agent state updates while the turn is still running. The state must be
+a JSON-serializable dict; anything else raises `TypeError` in the tool.
+
+Both raise `RuntimeError` outside a server tool. The session is found through a
+context variable set for the duration of the call, not through a tool
+parameter, because the SDK would put such a parameter into the tool's schema.
+
+A write made while the turn is parked (no run attached) is queued and delivered
+on the next run. Until then the adapter keeps its own copy rather than the
+client's, since the client's copy predates the write.
+
+The model does not see the state: only tools do. Folding `RunAgentInput.state`
+into the prompt is listed under [Not implemented yet](#not-implemented-yet).
 
 ### Built-in tools worth disabling
 
@@ -397,12 +432,17 @@ Deliberate gaps, so the surface above is not mistaken for more than it is:
 
 * **Triggers** (async inbound messages) and **multimodal input** — the SDK
   supports both; nothing here maps them to AG-UI yet.
-* **`STATE_DELTA`** — structured output is emitted as whole snapshots only.
+* **`STATE_DELTA`** — structured output and `set_state()` are emitted as whole
+  snapshots only.
+* **State and context in the prompt** — `RunAgentInput.state`, `context` and
+  `forwardedProps` reach server tools (state, via `get_state()`) but are not
+  folded into what the model sees.
 * **MCP servers** — passed through to the SDK config and covered by the
   approval hook, but not exercised by a live test.
 * **`predictive_state_updates` / `shared_state`** dojo features — the state
-  plumbing exists (`STATE_SNAPSHOT` from `structured_output`) but no demo agent
-  is wired for them, so they are not listed in the dojo menu.
+  plumbing exists (`STATE_SNAPSHOT` from `structured_output` and from
+  `set_state()`) but no demo agent is wired for them, so they are not listed in
+  the dojo menu.
 * Subagent bracketing is unit-tested against recorded step shapes, not against
   a live multi-agent run.
 

@@ -8,7 +8,7 @@ import pytest
 from ag_ui.core import Tool as AGUITool
 from google.antigravity import types as ag_types
 
-from ag_ui_antigravity.ui_bridge import UIBridge
+from ag_ui_antigravity.ui_bridge import UIBridge, get_state, set_state
 
 
 def make_tool(name="set_theme"):
@@ -683,3 +683,203 @@ class TestServerTools:
 
         bridge.build_server_tools([get_weather])
         assert "get_weather" in bridge.server_tool_names
+
+
+class TestSharedState:
+    """get_state() / set_state(): server tools reading and writing agent state."""
+
+    async def test_set_state_streams_a_snapshot_before_the_tool_result(self):
+        bridge = UIBridge()
+
+        async def log_step(note: str) -> str:
+            """Records a note.
+
+            Args:
+              note: The note.
+            """
+            state = get_state()
+            state.setdefault("notes", []).append(note)
+            set_state(state)
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([log_step])
+        await wrapped(note="first")
+
+        events = bridge.drain()
+        types = [e.type if isinstance(e.type, str) else e.type.value for e in events]
+        # The UI updates while the tool is still running, not after the turn.
+        assert types == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "STATE_SNAPSHOT",
+            "TOOL_CALL_RESULT",
+        ]
+        assert events[3].snapshot == {"notes": ["first"]}
+        assert bridge.state == {"notes": ["first"]}
+
+    async def test_get_state_starts_from_the_client_state(self):
+        bridge = UIBridge()
+        bridge.adopt_client_state({"todos": [{"id": "1"}]})
+        seen = {}
+
+        def read(key: str) -> str:
+            """Reads a key.
+
+            Args:
+              key: The key.
+            """
+            seen["state"] = get_state()
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([read])
+        await wrapped(key="todos")
+        assert seen["state"] == {"todos": [{"id": "1"}]}
+
+    async def test_get_state_returns_a_copy(self):
+        bridge = UIBridge()
+        bridge.adopt_client_state({"items": [1]})
+
+        def mutate(x: int) -> str:
+            """Mutates without saving.
+
+            Args:
+              x: A value.
+            """
+            get_state()["items"].append(x)
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([mutate])
+        await wrapped(x=2)
+        # Only set_state() changes what the session holds.
+        assert bridge.state == {"items": [1]}
+
+    async def test_consecutive_calls_accumulate(self):
+        bridge = UIBridge()
+
+        async def append(item: str) -> str:
+            """Appends an item.
+
+            Args:
+              item: The item.
+            """
+            state = get_state()
+            set_state({"items": state.get("items", []) + [item]})
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([append])
+        await wrapped(item="a")
+        await wrapped(item="b")
+        snapshots = [e.snapshot for e in bridge.drain() if e.type == "STATE_SNAPSHOT"]
+        assert snapshots == [{"items": ["a"]}, {"items": ["a", "b"]}]
+
+    def test_outside_a_server_tool_both_raise(self):
+        with pytest.raises(RuntimeError, match="inside a server tool"):
+            get_state()
+        with pytest.raises(RuntimeError, match="inside a server tool"):
+            set_state({})
+
+    async def test_the_tool_context_does_not_leak_after_the_call(self):
+        bridge = UIBridge()
+
+        def noop(x: int) -> str:
+            """Does nothing.
+
+            Args:
+              x: A value.
+            """
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([noop])
+        await wrapped(x=1)
+        with pytest.raises(RuntimeError):
+            get_state()
+
+    async def test_a_failing_tool_does_not_leak_its_context(self):
+        bridge = UIBridge()
+
+        def boom(x: int) -> str:
+            """Fails.
+
+            Args:
+              x: A value.
+            """
+            raise ValueError("no")
+
+        (wrapped,) = bridge.build_server_tools([boom])
+        with pytest.raises(ValueError):
+            await wrapped(x=1)
+        with pytest.raises(RuntimeError):
+            get_state()
+
+    async def test_concurrent_tools_on_two_sessions_see_their_own_state(self):
+        """The SDK dispatches tools concurrently; each must reach its own session."""
+        first, second = UIBridge(), UIBridge()
+        first.adopt_client_state({"who": "first"})
+        second.adopt_client_state({"who": "second"})
+        gate = asyncio.Event()
+        seen = []
+
+        async def who(x: int) -> str:
+            """Reports whose state it sees.
+
+            Args:
+              x: A value.
+            """
+            await gate.wait()
+            seen.append(get_state()["who"])
+            return "ok"
+
+        (a,) = first.build_server_tools([who])
+        (b,) = second.build_server_tools([who])
+        tasks = [asyncio.create_task(a(x=1)), asyncio.create_task(b(x=2))]
+        await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert sorted(seen) == ["first", "second"]
+
+    async def test_non_dict_and_non_json_state_is_rejected_in_the_tool(self):
+        bridge = UIBridge()
+
+        def bad(kind: str) -> str:
+            """Sets bad state.
+
+            Args:
+              kind: Which bad value.
+            """
+            set_state(["not", "a", "dict"] if kind == "list" else {"x": object()})
+            return "ok"
+
+        (wrapped,) = bridge.build_server_tools([bad])
+        with pytest.raises(TypeError):
+            await wrapped(kind="list")
+        with pytest.raises(TypeError):
+            await wrapped(kind="object")
+        assert bridge.state == {}
+        assert not any(e.type == "STATE_SNAPSHOT" for e in bridge.drain())
+
+    def test_client_state_replaces_the_session_state(self):
+        bridge = UIBridge()
+        bridge.adopt_client_state({"a": 1})
+        # The user edited the state in the UI; the next run carries the edit.
+        bridge.adopt_client_state({"a": 2})
+        assert bridge.state == {"a": 2}
+        bridge.adopt_client_state(None)
+        assert bridge.state == {}
+
+    def test_undelivered_server_state_is_not_overwritten_by_a_stale_client(self):
+        """A tool that ran while no run was attached has not reached the client.
+
+        The client's next run still carries the older state; adopting it would
+        drop the tool's write before the client ever saw it.
+        """
+        bridge = UIBridge()
+        bridge.adopt_client_state({"n": 1})
+        bridge.replace_state({"n": 2})
+        bridge.adopt_client_state({"n": 1})
+        assert bridge.state == {"n": 2}
+
+        # Once the snapshot has been delivered, the client is authoritative again.
+        bridge.drain()
+        bridge.adopt_client_state({"n": 3})
+        assert bridge.state == {"n": 3}

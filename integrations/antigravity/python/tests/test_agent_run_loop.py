@@ -20,7 +20,7 @@ from google.antigravity import types as ag_types
 
 from ag_ui_antigravity.agent import AntigravityAgent
 from ag_ui_antigravity.session_manager import AntigravitySession, SessionLimitExceeded
-from ag_ui_antigravity.ui_bridge import UIBridge
+from ag_ui_antigravity.ui_bridge import UIBridge, get_state, set_state
 
 
 BLOCK = object()
@@ -1799,3 +1799,106 @@ class TestToolContractSignature:
     async def test_an_identical_tool_set_keeps_the_signature(self):
         before, after = await self._signatures_for([self._tool()], [self._tool()])
         assert before == after
+
+
+class TestSharedStateThroughTheRun:
+    """get_state()/set_state() as a client sees them: through _run_locked."""
+
+    @staticmethod
+    def _delegating_bridge():
+        bridge = UIBridge()
+
+        async def delegate(task: str) -> str:
+            """Delegates a task.
+
+            Args:
+              task: The task.
+            """
+            state = get_state()
+            set_state(
+                {**state, "delegations": state.get("delegations", []) + [task]}
+            )
+            return "done"
+
+        (tool,) = bridge.build_server_tools([delegate])
+        return bridge, tool
+
+    async def test_a_tool_write_reaches_the_run_before_it_finishes(self):
+        agent = AntigravityAgent()
+        bridge, tool = self._delegating_bridge()
+
+        async def on_send():
+            await tool(task="research")
+
+        conversation = FakeConversation(
+            [[text_step("ok", done=True)]], on_send=on_send
+        )
+        session = make_session(conversation, bridge)
+        events = await drain(
+            agent._run_locked(session, run_input(state={"delegations": []}))
+        )
+        types = [e.type for e in events]
+        snapshots = [e for e in events if e.type == "STATE_SNAPSHOT"]
+        assert [s.snapshot for s in snapshots] == [{"delegations": ["research"]}]
+        assert types.index("STATE_SNAPSHOT") < types.index("TOOL_CALL_RESULT")
+        assert types[-1] == "RUN_FINISHED"
+
+    async def test_the_tool_sees_the_state_the_run_arrived_with(self):
+        agent = AntigravityAgent()
+        bridge, tool = self._delegating_bridge()
+
+        async def on_send():
+            await tool(task="write")
+
+        conversation = FakeConversation(
+            [[text_step("ok", done=True)]], on_send=on_send
+        )
+        session = make_session(conversation, bridge)
+        events = await drain(
+            agent._run_locked(
+                session,
+                run_input(state={"delegations": ["research"], "theme": "dark"}),
+            )
+        )
+        (snapshot,) = [e.snapshot for e in events if e.type == "STATE_SNAPSHOT"]
+        # Keys the tool did not touch survive: it replaced state it had read.
+        assert snapshot == {"delegations": ["research", "write"], "theme": "dark"}
+
+    async def test_a_write_while_parked_survives_the_stale_resume_state(self):
+        """The turn parked on a frontend tool; a server tool then wrote state.
+
+        The resume run's client state predates that write. The write must win
+        and reach the client on the resume run.
+        """
+        agent = AntigravityAgent()
+        bridge, server_tool = self._delegating_bridge()
+        tool_def = AGUITool(
+            name="set_theme",
+            description="",
+            parameters={"type": "object", "properties": {}},
+        )
+        (frontend_tool,) = bridge.build_frontend_tools([tool_def])
+
+        parked = asyncio.create_task(frontend_tool())
+        await asyncio.sleep(0.05)
+        tool_call_id = _tool_call_id(bridge.drain())
+        bridge.adopt_client_state({"delegations": []})
+        # No run is attached: this snapshot is queued, not yet delivered.
+        await server_tool(task="critique")
+
+        conversation = FakeConversation([[text_step("ok", done=True)]])
+        session = make_session(conversation, bridge, forwarded={"m1"})
+        events = await drain(
+            agent._run_locked(
+                session,
+                run_input(
+                    tools=[tool_def],
+                    state={"delegations": []},
+                    messages=_resume_messages(tool_call_id),
+                ),
+            )
+        )
+        assert await asyncio.wait_for(parked, 1) == "dark"
+        snapshots = [e.snapshot for e in events if e.type == "STATE_SNAPSHOT"]
+        assert snapshots == [{"delegations": ["critique"]}]
+        assert bridge.state == {"delegations": ["critique"]}

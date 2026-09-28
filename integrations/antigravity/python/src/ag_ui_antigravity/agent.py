@@ -470,6 +470,7 @@ class AntigravityAgent:
         self, session, input_data: RunAgentInput
     ) -> AsyncGenerator[BaseEvent, None]:
         bridge: UIBridge = session.bridge
+        bridge.adopt_client_state(input_data.state)
 
         # ---- resolve anything the client answered since the last run ----
         resumed = self._apply_client_answers(bridge, input_data)
